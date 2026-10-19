@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { fileNotes, polishNotes, puterSession, puterSignIn, puterSignOut, type Assignment, type Tier } from "./ai";
+import { fileNotes, puterSession, puterSignIn, puterSignOut, reviewNotes, type Assignment, type Correction } from "./ai";
 import { supabase } from "./supabase";
 import { loadPrefs, readJSON, removeKey, savePrefs, writeJSON, type Prefs } from "./storage";
 import { detectKind } from "./sorter/kind";
@@ -124,14 +124,19 @@ let version = 0;
 let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
 let warnedQuota = false;
 
+let dirty = false;
+
 function persistSnapshot() {
+  dirty = true;
   clearTimeout(snapshotTimer);
   snapshotTimer = setTimeout(flushSnapshot, 150);
 }
 
+/** Writes the snapshot — only when something changed, so a stale tab never overwrites a newer one. */
 function flushSnapshot() {
   clearTimeout(snapshotTimer);
-  if (state.phase !== "ready") return;
+  if (state.phase !== "ready" || !dirty) return;
+  dirty = false;
   if (!writeJSON(dataKey(state.scope), state.data) && !warnedQuota) {
     warnedQuota = true;
     toast({ message: "This browser is out of storage space — export your notes soon.", tone: "error" }, 8000);
@@ -250,6 +255,7 @@ export async function refresh(force = false) {
     let data: Data = { notebooks, topics, notes };
     for (const op of outbox) data = applyOp(data, op);
     set({ data });
+    dirty = true;
     flushSnapshot();
   } catch (e) {
     console.warn("xnotebook: refresh failed", e);
@@ -265,6 +271,7 @@ const MODE_KEY = "xnb:mode";
 
 function enterScope(scope: Scope) {
   flushSnapshot();
+  dirty = false;
   clearTimeout(retryTimer);
   outbox = scope.kind === "cloud" ? readJSON<Op[]>(outboxKey(scope), []) : [];
   version++;
@@ -281,8 +288,15 @@ function enterScope(scope: Scope) {
   }
 }
 
+let booted = false;
+
 export async function boot() {
+  if (booted) return;
+  booted = true;
   if (state.prefs.smartFiling) void checkPuter();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && smartFilingOn()) reviewStale();
+  });
   if (!supabase) {
     enterScope({ kind: "local" });
     return;
@@ -323,9 +337,18 @@ export async function boot() {
 
 if (typeof window !== "undefined") {
   window.addEventListener("pagehide", flushSnapshot);
+  // Another tab saved: pick up its copy (unless we have unsaved changes of our own).
+  window.addEventListener("storage", (e) => {
+    if (state.phase !== "ready" || dirty || e.key !== dataKey(state.scope) || !e.newValue) return;
+    try {
+      set({ data: JSON.parse(e.newValue) as Data });
+    } catch {
+      /* ignore a half-written value */
+    }
+  });
 }
 
-export function useThisDeviceOnly() {
+export function keepOnThisDevice() {
   writeJSON(MODE_KEY, "local");
   enterScope({ kind: "local" });
 }
@@ -415,6 +438,7 @@ async function checkPuter() {
   set({ puter: { state: "checking" } });
   const username = await puterSession();
   set({ puter: username ? { state: "signed-in", username } : { state: "signed-out" } });
+  if (username) reviewStale();
 }
 
 /** Call from a click: Puter opens a sign-in popup. */
@@ -575,16 +599,21 @@ export function jot(notebookId: string, raw: string): JotResult | null {
     kind: detectKind(content),
     pinned: false,
     sorted_by: sortedBy,
+    review: null,
+    flag: null,
     created_at: t,
     updated_at: t,
   };
   ops.push({ t: "note", row: note });
   commit(ops);
-  if (smartFilingOn() && (!tag || state.prefs.rewrite)) queueSmartFiling([note.id]);
+  if (smartFilingOn()) {
+    if (!tag || state.prefs.rewrite) queueSmartFiling([note.id]);
+    scheduleQuietReview(notebookId);
+  }
   return { note, topic, via: tag ? "hashtag" : topic ? "auto" : "loose" };
 }
 
-export function updateNote(id: string, patch: Partial<Pick<Note, "content" | "kind" | "pinned" | "original">>) {
+export function updateNote(id: string, patch: Partial<Pick<Note, "content" | "kind" | "pinned" | "original" | "flag">>) {
   const n = state.data.notes.find((x) => x.id === id);
   if (!n) return;
   commit([{ t: "note", row: { ...n, ...patch, updated_at: now() } }]);
@@ -638,15 +667,21 @@ export function refileLoose(notebookId: string): number | "smart" {
 }
 
 /* ───────────────────────── smart filing (Claude via Puter) ─────────────────────────
- * Haiku files every bit a moment after you jot it (batched, so a burst of
- * jots is one request). Bits Haiku isn't sure about get a second look from
- * Sonnet. "Polish" sends a whole topic to Sonnet for a careful rewrite.
+ * Haiku files and tidies every bit a moment after you jot it (batched, so a
+ * burst of jots is one request). Every so often — after a quiet spell, or a
+ * dozen new bits — Sonnet reviews Haiku's work: re-files strays, fixes
+ * rewrites that drifted, and pencils in a margin note if a fact looks off.
  */
+
+const REVIEW_AFTER = 12;
+const QUIET_MS = 8 * 60_000;
 
 const aiQueue = new Set<string>();
 let aiTimer: ReturnType<typeof setTimeout> | undefined;
 let aiRunning = false;
+let reviewRunning = false;
 let warnedAi = false;
+const quietTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function markPending(ids: string[], on: boolean) {
   const pending = new Set(state.aiPending);
@@ -677,21 +712,19 @@ function groupByNotebook(ids: string[]): Map<string, Note[]> {
   return out;
 }
 
-async function fileBatch(notebookId: string, notes: Note[], tier: Tier): Promise<string[]> {
-  const notebook = state.data.notebooks.find((n) => n.id === notebookId);
-  const sent = new Map(notes.map((n) => [n.id, n.content]));
-  const assignments = await fileNotes(
-    {
-      notebook: notebook?.name ?? "",
-      topics: topicsOf(notebookId).map((t) => t.name),
-      notes: notes.map((n) => ({ id: n.id, content: n.original ?? n.content })),
-      rewrite: state.prefs.rewrite,
-    },
-    tier,
-    tier === "fast" ? state.prefs.aiFast : state.prefs.aiSmart,
-  );
-  applyAssignments(notebookId, assignments, sent);
-  return assignments.filter((a) => !a.confident).map((a) => a.id);
+const topicName = (id: string | null) => state.data.topics.find((t) => t.id === id)?.name ?? null;
+
+/** Finds a topic by name, or makes one (collected in `fresh` so a batch doesn't duplicate it). */
+function topicFor(notebookId: string, name: string, fresh: Map<string, Topic>, ops: Op[]): string {
+  const key = name.trim().toLowerCase();
+  const existing = topicsOf(notebookId).find((t) => sameName(t.name, name)) ?? fresh.get(key);
+  if (existing) return existing.id;
+  const topic = makeTopic(notebookId, name);
+  // makeTopic only sees committed topics; offset so one batch doesn't reuse a colour.
+  topic.color = TAB_COLORS[(topicsOf(notebookId).length + fresh.size) % TAB_COLORS.length] as TabColor;
+  fresh.set(key, topic);
+  ops.push({ t: "topic", row: topic });
+  return topic.id;
 }
 
 async function runSmartFiling() {
@@ -705,13 +738,22 @@ async function runSmartFiling() {
   aiRunning = true;
   try {
     for (const [notebookId, notes] of groupByNotebook(ids)) {
+      const notebook = state.data.notebooks.find((n) => n.id === notebookId);
       for (let i = 0; i < notes.length; i += 25) {
-        const unsure = await fileBatch(notebookId, notes.slice(i, i + 25), "fast");
-        if (unsure.length) {
-          const second = unsure.map((id) => state.data.notes.find((n) => n.id === id)).filter((n): n is Note => !!n);
-          await fileBatch(notebookId, second, "smart");
-        }
+        const chunk = notes.slice(i, i + 25);
+        const sent = new Map(chunk.map((n) => [n.id, n.content]));
+        const assignments = await fileNotes(
+          {
+            notebook: notebook?.name ?? "",
+            topics: topicsOf(notebookId).map((t) => t.name),
+            notes: chunk.map((n) => ({ id: n.id, content: n.original ?? n.content })),
+            rewrite: state.prefs.rewrite,
+          },
+          state.prefs.aiFast,
+        );
+        applyFiling(notebookId, assignments, sent);
       }
+      maybeReview(notebookId, false);
     }
   } catch (e) {
     warnAi(e);
@@ -721,69 +763,19 @@ async function runSmartFiling() {
   }
 }
 
-/** Careful Sonnet rewrite of the given notes (clarity + LaTeX). Keeps topics as they are. */
-export async function polish(noteIds: string[]): Promise<number> {
-  if (state.puter.state !== "signed-in" || noteIds.length === 0) return 0;
-  markPending(noteIds, true);
-  let changed = 0;
-  try {
-    for (const [notebookId, notes] of groupByNotebook(noteIds)) {
-      const notebook = state.data.notebooks.find((n) => n.id === notebookId);
-      for (let i = 0; i < notes.length; i += 20) {
-        const chunk = notes.slice(i, i + 20);
-        const sent = new Map(chunk.map((n) => [n.id, n.content]));
-        const topicName = (id: string | null) => state.data.topics.find((t) => t.id === id)?.name ?? null;
-        const result = await polishNotes(
-          notebook?.name ?? "",
-          chunk.map((n) => ({ id: n.id, content: n.content, topic: topicName(n.topic_id), kind: n.kind })),
-          state.prefs.aiSmart,
-        );
-        const ops: Op[] = [];
-        for (const a of result) {
-          const n = state.data.notes.find((x) => x.id === a.id);
-          if (!n || !a.rewrite || a.rewrite === n.content || sent.get(n.id) !== n.content) continue;
-          ops.push({ t: "note", row: { ...n, content: a.rewrite, original: n.original ?? n.content, updated_at: now() } });
-        }
-        commit(ops);
-        changed += ops.length;
-      }
-    }
-  } catch (e) {
-    warnAi(e);
-  } finally {
-    markPending(noteIds, false);
-  }
-  return changed;
-}
-
 /**
  * @param sent each note's content when it was sent off — if you edited it
- * since, Claude's rewrite is dropped so your edit wins.
+ * since, the rewrite is dropped so your edit wins.
  */
-function applyAssignments(notebookId: string, assignments: Assignment[], sent: Map<string, string>) {
+function applyFiling(notebookId: string, assignments: Assignment[], sent: Map<string, string>) {
   const ops: Op[] = [];
-  const newTopics = new Map<string, Topic>();
+  const fresh = new Map<string, Topic>();
   for (const a of assignments) {
     const n = state.data.notes.find((x) => x.id === a.id);
     if (!n) continue;
-    let topicId = n.topic_id;
     // Bits you filed by hand (or with #topic) stay where you put them.
-    if (n.sorted_by !== "you" && a.topic) {
-      const name = a.topic.trim();
-      const existing = topicsOf(notebookId).find((t) => sameName(t.name, name)) ?? newTopics.get(name.toLowerCase());
-      if (existing) topicId = existing.id;
-      else {
-        const topic = makeTopic(notebookId, name);
-        // makeTopic only sees committed topics; offset so one batch doesn't reuse a colour.
-        topic.color = TAB_COLORS[(topicsOf(notebookId).length + newTopics.size) % TAB_COLORS.length] as TabColor;
-        newTopics.set(name.toLowerCase(), topic);
-        ops.push({ t: "topic", row: topic });
-        topicId = topic.id;
-      }
-    }
-    const unchanged = sent.get(n.id) === n.content;
-    const rewrite = unchanged && a.rewrite && a.rewrite !== n.content ? a.rewrite : null;
-    if (topicId === n.topic_id && a.kind === n.kind && !rewrite) continue;
+    const topicId = n.sorted_by !== "you" && a.topic ? topicFor(notebookId, a.topic, fresh, ops) : n.topic_id;
+    const rewrite = sent.get(n.id) === n.content && a.rewrite && a.rewrite !== n.content ? a.rewrite : null;
     ops.push({
       t: "note",
       row: {
@@ -793,11 +785,159 @@ function applyAssignments(notebookId: string, assignments: Assignment[], sent: M
         sorted_by: topicId !== n.topic_id ? "ai" : n.sorted_by,
         content: rewrite ?? n.content,
         original: rewrite ? (n.original ?? n.content) : n.original,
+        review: n.review === "done" && !rewrite && topicId === n.topic_id ? "done" : "pending",
         updated_at: now(),
       },
     });
   }
   commit(ops);
+}
+
+/* ── review pass ── */
+
+export interface MergeSuggestion {
+  notebookId: string;
+  fromId: string;
+  intoId: string;
+}
+
+let mergeSuggestions: MergeSuggestion[] = [];
+const suggestionListeners = new Set<() => void>();
+
+export function useMergeSuggestions(): MergeSuggestion[] {
+  return useSyncExternalStore(
+    (l) => {
+      suggestionListeners.add(l);
+      return () => suggestionListeners.delete(l);
+    },
+    () => mergeSuggestions,
+  );
+}
+
+export function dismissMerge(s: MergeSuggestion) {
+  mergeSuggestions = mergeSuggestions.filter((x) => x !== s);
+  suggestionListeners.forEach((l) => l());
+}
+
+export function acceptMerge(s: MergeSuggestion) {
+  dismissMerge(s);
+  if (state.data.topics.some((t) => t.id === s.fromId) && state.data.topics.some((t) => t.id === s.intoId)) {
+    mergeTopic(s.fromId, s.intoId);
+  }
+}
+
+function scheduleQuietReview(notebookId: string) {
+  clearTimeout(quietTimers.get(notebookId));
+  quietTimers.set(
+    notebookId,
+    setTimeout(() => maybeReview(notebookId, true), QUIET_MS),
+  );
+}
+
+function maybeReview(notebookId: string, quiet: boolean) {
+  if (!smartFilingOn() || !state.prefs.autoReview) return;
+  const pending = notesOf(notebookId).filter((n) => n.review === "pending" && !state.aiPending.has(n.id));
+  if (pending.length && (quiet || pending.length >= REVIEW_AFTER)) void review(pending.map((n) => n.id));
+}
+
+/** Catch up on notebooks whose class ended while the app was closed. */
+function reviewStale() {
+  const cutoff = Date.now() - QUIET_MS;
+  for (const nb of state.data.notebooks) {
+    const notes = notesOf(nb.id);
+    const latest = notes.reduce((m, n) => (n.created_at > m ? n.created_at : m), "");
+    if (latest && Date.parse(latest) < cutoff) maybeReview(nb.id, true);
+  }
+}
+
+export interface ReviewResult {
+  checked: number;
+  changed: number;
+  flagged: number;
+}
+
+/** Sonnet reads back over these notes. Also what the "Review" buttons call. */
+export async function review(noteIds: string[]): Promise<ReviewResult | null> {
+  if (state.puter.state !== "signed-in" || noteIds.length === 0 || reviewRunning) return null;
+  reviewRunning = true;
+  markPending(noteIds, true);
+  const result: ReviewResult = { checked: 0, changed: 0, flagged: 0 };
+  try {
+    for (const [notebookId, notes] of groupByNotebook(noteIds)) {
+      const notebook = state.data.notebooks.find((n) => n.id === notebookId);
+      for (let i = 0; i < notes.length; i += 20) {
+        const chunk = notes.slice(i, i + 20);
+        const sent = new Map(chunk.map((n) => [n.id, n.content]));
+        const r = await reviewNotes(
+          {
+            notebook: notebook?.name ?? "",
+            topics: topicsOf(notebookId).map((t) => t.name),
+            notes: chunk.map((n) => ({
+              id: n.id,
+              typed: n.original ?? n.content,
+              current: n.content,
+              topic: topicName(n.topic_id),
+              kind: n.kind,
+            })),
+            rewrite: state.prefs.rewrite,
+          },
+          state.prefs.aiSmart,
+        );
+        applyReview(notebookId, r.corrections, sent, result);
+        for (const m of r.merges) {
+          const from = topicsOf(notebookId).find((t) => sameName(t.name, m.from));
+          const into = topicsOf(notebookId).find((t) => sameName(t.name, m.into));
+          if (from && into && from.id !== into.id && !mergeSuggestions.some((x) => x.fromId === from.id && x.intoId === into.id)) {
+            mergeSuggestions = [...mergeSuggestions, { notebookId, fromId: from.id, intoId: into.id }];
+            suggestionListeners.forEach((l) => l());
+          }
+        }
+      }
+    }
+    return result;
+  } catch (e) {
+    warnAi(e);
+    return null;
+  } finally {
+    reviewRunning = false;
+    markPending(noteIds, false);
+  }
+}
+
+function applyReview(notebookId: string, corrections: Correction[], sent: Map<string, string>, result: ReviewResult) {
+  const ops: Op[] = [];
+  const fresh = new Map<string, Topic>();
+  for (const c of corrections) {
+    const n = state.data.notes.find((x) => x.id === c.id);
+    if (!n) continue;
+    result.checked++;
+    const topicId = n.sorted_by !== "you" && c.topic && !sameName(c.topic, topicName(n.topic_id) ?? "") ? topicFor(notebookId, c.topic, fresh, ops) : n.topic_id;
+    const typed = n.original ?? n.content;
+    const text = sent.get(n.id) === n.content && c.text && c.text !== n.content ? c.text : null;
+    const changed = topicId !== n.topic_id || c.kind !== n.kind || text !== null;
+    if (changed) result.changed++;
+    if (c.flag) result.flagged++;
+    ops.push({
+      t: "note",
+      row: {
+        ...n,
+        topic_id: topicId,
+        kind: c.kind,
+        sorted_by: topicId !== n.topic_id ? "ai" : n.sorted_by,
+        content: text ?? n.content,
+        original: text ? (text === typed ? null : typed) : n.original,
+        flag: c.flag,
+        review: "done",
+        updated_at: now(),
+      },
+    });
+  }
+  commit(ops);
+}
+
+export function dismissFlag(id: string) {
+  const n = state.data.notes.find((x) => x.id === id);
+  if (n) commit([{ t: "note", row: { ...n, flag: null, updated_at: now() } }]);
 }
 
 /* ───────────────────────── misc ───────────────────────── */

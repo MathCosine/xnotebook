@@ -35,11 +35,13 @@ export interface Prefs {
   /** Claude model ids on Puter, or "auto" for the newest Haiku / Sonnet. */
   aiFast: string;
   aiSmart: string;
+  /** Let Sonnet review new bits on its own (after a quiet spell or a dozen new bits). */
+  autoReview: boolean;
   lastNotebookId: string | null;
 }
 
 const PREFS_KEY = "xnb:prefs";
-const DEFAULT_PREFS: Prefs = { theme: "system", smartFiling: false, rewrite: true, aiFast: "auto", aiSmart: "auto", lastNotebookId: null };
+const DEFAULT_PREFS: Prefs = { theme: "system", smartFiling: false, rewrite: true, aiFast: "auto", aiSmart: "auto", autoReview: true, lastNotebookId: null };
 
 export function loadPrefs(): Prefs {
   return { ...DEFAULT_PREFS, ...readJSON<Partial<Prefs>>(PREFS_KEY, {}) };

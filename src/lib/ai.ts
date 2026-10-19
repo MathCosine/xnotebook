@@ -81,9 +81,9 @@ export async function puterSignOut() {
 }
 
 /* ───────────── model choice ─────────────
- * Two tiers keep it cheap: Haiku files every bit live during class, and
- * Sonnet only steps in for bits Haiku wasn't sure about, or when you ask
- * for a careful "polish" pass afterwards.
+ * Two tiers keep it cheap: Haiku files and tidies every bit live during
+ * class; every so often Sonnet reads back over the new bits and checks
+ * Haiku's work (filing, faithfulness of rewrites, factual slips).
  */
 
 export type Tier = "fast" | "smart";
@@ -130,7 +130,48 @@ export async function resolveModel(tier: Tier, pref: string): Promise<string> {
   return models.find((m) => m.startsWith(FAMILY[tier])) ?? FALLBACK[tier];
 }
 
-/* ───────────── filing + rewriting ───────────── */
+/* ───────────── shared bits ───────────── */
+
+const REWRITE_RULES = `Fix typos, expand obvious shorthand, make it read clearly — but keep it as short as the original allows, keep the student's meaning, and never add facts they didn't write. Put all math, chemistry and units in LaTeX: $...$ inline, $$...$$ for a standalone equation (e.g. "$F = ma$", "$\\frac{dy}{dx}$", "$\\text{H}_2\\text{O}$", "$9.8\\,\\text{m/s}^2$"). Bold the term being defined with **term**.`;
+
+const KINDS = `fact | definition | exam (teacher hinted it'll be tested, or flagged it as important) | todo (homework, deadlines, things to do) | question (something to look up or ask) | formula`;
+
+const TOPIC_RULES = `the existing topic it belongs to, copied exactly. If none fits, make up a new topic name: 1–3 words, Title Case, naming the concept (e.g. "Cell Division", not "Mitosis Notes"). Reuse a new name you made up for other notes in this batch when they fit. Only use null for pure logistics with no subject matter ("bring a calculator").`;
+
+const topicList = (topics: string[]) => (topics.length ? topics.map((t) => `- ${t}`).join("\n") : "(none yet)");
+
+const nullableString = { type: ["string", "null"] };
+
+function textOf(res: PuterChatResponse): string {
+  const c = res?.message?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.map((b) => b.text ?? "").join("");
+  return String(res ?? "");
+}
+
+async function ask(system: string, user: unknown, schema: object, tier: Tier, modelPref: string): Promise<unknown> {
+  const puter = await loadPuter();
+  const model = await resolveModel(tier, modelPref);
+  const res = await puter.ai.chat(
+    [
+      { role: "system", content: system },
+      { role: "user", content: JSON.stringify(user) },
+    ],
+    {
+      model,
+      normalize: true,
+      max_tokens: 6000,
+      outputFormat: { type: "json_schema", name: "notes", schema, strict: true },
+    },
+  );
+  const text = textOf(res);
+  return JSON.parse(text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1));
+}
+
+const str = (v: unknown, max: number) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null);
+const kindOf = (v: unknown): NoteKind => (NOTE_KINDS.includes(v as NoteKind) ? (v as NoteKind) : "fact");
+
+/* ───────────── live filing (Haiku) ───────────── */
 
 export interface FilingInput {
   notebook: string;
@@ -144,11 +185,9 @@ export interface Assignment {
   topic: string | null;
   kind: NoteKind;
   rewrite: string | null;
-  /** false → hand this one to the smarter model. */
-  confident: boolean;
 }
 
-const SCHEMA = {
+const FILING_SCHEMA = {
   type: "object",
   properties: {
     assignments: {
@@ -157,12 +196,11 @@ const SCHEMA = {
         type: "object",
         properties: {
           id: { type: "string" },
-          topic: { type: ["string", "null"] },
+          topic: nullableString,
           kind: { type: "string", enum: NOTE_KINDS },
-          rewrite: { type: ["string", "null"] },
-          confident: { type: "boolean" },
+          rewrite: nullableString,
         },
-        required: ["id", "topic", "kind", "rewrite", "confident"],
+        required: ["id", "topic", "kind", "rewrite"],
         additionalProperties: false,
       },
     },
@@ -171,93 +209,131 @@ const SCHEMA = {
   additionalProperties: false,
 };
 
-const REWRITE_RULES = `Fix typos, expand obvious shorthand, make it read clearly — but keep it as short as the original allows, keep the student's meaning, and never add facts they didn't write. Put all math, chemistry and units in LaTeX: $...$ inline, $$...$$ for a standalone equation (e.g. "$F = ma$", "$\\frac{dy}{dx}$", "$\\text{H}_2\\text{O}$", "$9.8\\,\\text{m/s}^2$"). Bold the term being defined with **term**.`;
-
-function filingPrompt(input: FilingInput, tier: Tier): string {
-  const topics = input.topics.length ? input.topics.map((t) => `- ${t}`).join("\n") : "(none yet)";
+function filingPrompt(input: FilingInput): string {
   return `You file a student's quick notes from class into their notebook "${input.notebook}".
 
 Existing topics in this notebook:
-${topics}
+${topicList(input.topics)}
 
 For every note, return:
-- topic: the existing topic it belongs to, copied exactly. If none fits, make up a new topic name: 1–3 words, Title Case, naming the concept (e.g. "Cell Division", not "Mitosis Notes"). Reuse a new name you made up for other notes in this batch when they fit. Only use null for pure logistics with no subject matter ("bring a calculator").
-- kind: fact | definition | exam (teacher hinted it'll be tested, or flagged it as important) | todo (homework, deadlines, things to do) | question (something to look up or ask) | formula.
-${
-  input.rewrite
-    ? `- rewrite: a tidier version of the note for a clean notebook. ${REWRITE_RULES} Return null if the note is already clean and has no math to format.`
-    : `- rewrite: always null.`
-}
-- confident: ${
-    tier === "fast"
-      ? "false if you're unsure which topic fits, the shorthand is ambiguous, or the note has math/notation you might typeset wrong; otherwise true."
-      : "always true."
+- topic: ${TOPIC_RULES}
+- kind: ${KINDS}.
+- rewrite: ${
+    input.rewrite
+      ? `a tidier version of the note for a clean notebook. ${REWRITE_RULES} Return null if the note is already clean and has no math to format.`
+      : "always null."
   }
 
 Answer with JSON matching the schema, one entry per note id.`;
 }
 
-function polishPrompt(notebook: string): string {
-  return `You're polishing a student's class notes from their notebook "${notebook}" so they're clear to study from later.
-
-For every note, return:
-- rewrite: the polished note. ${REWRITE_RULES} Return null if it's already as clear as it can be.
-- topic, kind: copy them from the input unchanged.
-- confident: true.
-
-Answer with JSON matching the schema, one entry per note id.`;
-}
-
-function textOf(res: PuterChatResponse): string {
-  const c = res?.message?.content;
-  if (typeof c === "string") return c;
-  if (Array.isArray(c)) return c.map((b) => b.text ?? "").join("");
-  return String(res ?? "");
-}
-
-function parseAssignments(text: string, ids: Set<string>): Assignment[] {
-  const json = text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
-  const parsed = JSON.parse(json) as { assignments?: unknown };
-  if (!Array.isArray(parsed.assignments)) throw new Error("AI reply had no assignments");
-  const out: Assignment[] = [];
-  for (const a of parsed.assignments as Array<Record<string, unknown>>) {
-    if (typeof a?.id !== "string" || !ids.has(a.id)) continue;
-    const topic = typeof a.topic === "string" && a.topic.trim() ? a.topic.trim().slice(0, 80) : null;
-    const kind = NOTE_KINDS.includes(a.kind as NoteKind) ? (a.kind as NoteKind) : "fact";
-    const rewrite = typeof a.rewrite === "string" && a.rewrite.trim() ? a.rewrite.trim().slice(0, 4000) : null;
-    out.push({ id: a.id, topic, kind, rewrite, confident: a.confident !== false });
-  }
-  return out;
-}
-
-async function ask(system: string, user: unknown, tier: Tier, modelPref: string, ids: Set<string>): Promise<Assignment[]> {
-  const puter = await loadPuter();
-  const model = await resolveModel(tier, modelPref);
-  const res = await puter.ai.chat(
-    [
-      { role: "system", content: system },
-      { role: "user", content: JSON.stringify(user) },
-    ],
-    {
-      model,
-      normalize: true,
-      max_tokens: 4000,
-      outputFormat: { type: "json_schema", name: "notes", schema: SCHEMA, strict: true },
-    },
-  );
-  return parseAssignments(textOf(res), ids);
-}
-
-export function fileNotes(input: FilingInput, tier: Tier, modelPref: string): Promise<Assignment[]> {
+export async function fileNotes(input: FilingInput, modelPref: string): Promise<Assignment[]> {
   const ids = new Set(input.notes.map((n) => n.id));
-  return ask(filingPrompt(input, tier), { notes: input.notes }, tier, modelPref, ids);
+  const out = (await ask(filingPrompt(input), { notes: input.notes }, FILING_SCHEMA, "fast", modelPref)) as {
+    assignments?: Array<Record<string, unknown>>;
+  };
+  if (!Array.isArray(out.assignments)) throw new Error("AI reply had no assignments");
+  return out.assignments
+    .filter((a) => typeof a?.id === "string" && ids.has(a.id))
+    .map((a) => ({ id: a.id as string, topic: str(a.topic, 80), kind: kindOf(a.kind), rewrite: str(a.rewrite, 4000) }));
 }
 
-export function polishNotes(
-  notebook: string,
-  notes: Array<{ id: string; content: string; topic: string | null; kind: NoteKind }>,
-  modelPref: string,
-): Promise<Assignment[]> {
-  const ids = new Set(notes.map((n) => n.id));
-  return ask(polishPrompt(notebook), { notes }, "smart", modelPref, ids);
+/* ───────────── review pass (Sonnet) ───────────── */
+
+export interface ReviewInput {
+  notebook: string;
+  topics: string[];
+  notes: Array<{ id: string; typed: string; current: string; topic: string | null; kind: NoteKind }>;
+  rewrite: boolean;
+}
+
+export interface Correction {
+  id: string;
+  topic: string | null;
+  kind: NoteKind;
+  /** Replacement text, or null to keep the current text. */
+  text: string | null;
+  /** A short red-pen margin note when something looks factually off. */
+  flag: string | null;
+}
+
+export interface Review {
+  corrections: Correction[];
+  merges: Array<{ from: string; into: string }>;
+}
+
+const REVIEW_SCHEMA = {
+  type: "object",
+  properties: {
+    notes: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          topic: nullableString,
+          kind: { type: "string", enum: NOTE_KINDS },
+          text: nullableString,
+          flag: nullableString,
+        },
+        required: ["id", "topic", "kind", "text", "flag"],
+        additionalProperties: false,
+      },
+    },
+    merges: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { from: { type: "string" }, into: { type: "string" } },
+        required: ["from", "into"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["notes", "merges"],
+  additionalProperties: false,
+};
+
+function reviewPrompt(input: ReviewInput): string {
+  return `You're checking a student's class notebook "${input.notebook}". A faster assistant filed each note into a topic${
+    input.rewrite ? " and tidied its wording" : ""
+  } while the student was in class. Read back over its work.
+
+Topics in this notebook:
+${topicList(input.topics)}
+
+Each note has "typed" (exactly what the student wrote), "current" (what's in the notebook now), its "topic" and "kind". For every note return:
+- topic: is it in the right place? Return the correct topic — usually the current one. ${TOPIC_RULES}
+- kind: ${KINDS}. Correct it if it's wrong.
+- text: null if "current" is fine. Otherwise the corrected text — when the rewrite changed the student's meaning, invented something they didn't write, dropped something important, or has broken or missing LaTeX.${
+    input.rewrite ? ` ${REWRITE_RULES}` : ` Keep it to the student's own words.`
+  }
+- flag: if the note states something that's factually wrong or very likely misheard (a wrong number, date, name, formula or definition), a short, kind correction in at most 20 words, like a teacher's note in the margin. Otherwise null. Don't flag opinions, shorthand, or things that are merely incomplete.
+
+Also return merges: pairs of existing topics that are really the same subject and should be one ({"from": "Cell Cycle", "into": "Cell Division"}). Usually this is empty.
+
+Answer with JSON matching the schema, one entry per note id.`;
+}
+
+export async function reviewNotes(input: ReviewInput, modelPref: string): Promise<Review> {
+  const ids = new Set(input.notes.map((n) => n.id));
+  const out = (await ask(reviewPrompt(input), { notes: input.notes }, REVIEW_SCHEMA, "smart", modelPref)) as {
+    notes?: Array<Record<string, unknown>>;
+    merges?: Array<Record<string, unknown>>;
+  };
+  if (!Array.isArray(out.notes)) throw new Error("AI reply had no notes");
+  return {
+    corrections: out.notes
+      .filter((a) => typeof a?.id === "string" && ids.has(a.id))
+      .map((a) => ({
+        id: a.id as string,
+        topic: str(a.topic, 80),
+        kind: kindOf(a.kind),
+        text: str(a.text, 4000),
+        flag: str(a.flag, 240),
+      })),
+    merges: (out.merges ?? [])
+      .map((m) => ({ from: str(m.from, 80) ?? "", into: str(m.into, 80) ?? "" }))
+      .filter((m) => m.from && m.into && m.from !== m.into),
+  };
 }

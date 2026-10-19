@@ -21,6 +21,8 @@ const note = (id: string, content: string, topic_id: string | null = null): Note
   kind: "fact",
   pinned: false,
   sorted_by: null,
+  review: null,
+  flag: null,
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
 });

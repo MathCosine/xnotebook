@@ -31,6 +31,10 @@ export interface Note {
   kind: NoteKind;
   pinned: boolean;
   sorted_by: SortedBy | null;
+  /** "pending" once Haiku has filed it, "done" after Sonnet's review pass. */
+  review: "pending" | "done" | null;
+  /** Sonnet's red-pen margin note when something looks factually off. */
+  flag: string | null;
   created_at: string;
   updated_at: string;
 }
